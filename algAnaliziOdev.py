@@ -4,6 +4,8 @@ import random
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+import multiprocessing as mp  # <-- parallel brute force
+
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
@@ -40,6 +42,7 @@ def graham_scan(points):
     pts = [p for p in points if p != pivot]
     pts.sort(key=lambda p: (polar_angle(pivot, p), dist2(pivot, p)))
 
+    # same-angle keep farthest
     filtered = []
     i = 0
     while i < len(pts):
@@ -66,7 +69,7 @@ def graham_scan(points):
 
 
 # -------------------------
-# Brute Force (Worst-case O(n^3))
+# Brute Force (Single-core O(n^3))
 # -------------------------
 def brute_force_hull(points):
     n = len(points)
@@ -106,7 +109,89 @@ def brute_force_hull(points):
     cx = sum(p[0] for p in hull_pts) / len(hull_pts)
     cy = sum(p[1] for p in hull_pts) / len(hull_pts)
     hull_pts.sort(key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+    return hull_pts
 
+
+# -------------------------
+# Parallel Brute Force (Multi-core)
+# -------------------------
+def _bf_worker(args):
+    """
+    Worker: checks a chunk of (i,j) pairs, returns a set of hull edge endpoints.
+    """
+    points, pairs = args
+    n = len(points)
+    edges = set()
+
+    def _cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    for (i, j) in pairs:
+        p = points[i]
+        q = points[j]
+        pos = neg = 0
+
+        for k in range(n):
+            if k == i or k == j:
+                continue
+            r = points[k]
+            c = _cross(p, q, r)
+            if c > 0:
+                pos += 1
+            elif c < 0:
+                neg += 1
+            if pos and neg:
+                break
+
+        if not (pos and neg):
+            edges.add(p)
+            edges.add(q)
+
+    return edges
+
+
+def brute_force_hull_parallel(points, processes=None, chunk_pairs=6000):
+    """
+    Parallel brute force convex hull.
+
+    processes: None -> use (cpu_count - 1)
+    chunk_pairs: number of (i,j) pairs per task (tune; 4k-12k often good)
+    """
+    n = len(points)
+    if n <= 1:
+        return points[:]
+    if n == 2:
+        return points[:] if points[0] != points[1] else [points[0]]
+
+    if processes is None:
+        processes = max(1, mp.cpu_count() - 1)
+
+    tasks = []
+    pairs_chunk = []
+
+    # Build pair chunks
+    for i in range(n):
+        for j in range(i + 1, n):
+            pairs_chunk.append((i, j))
+            if len(pairs_chunk) >= chunk_pairs:
+                tasks.append((points, pairs_chunk))
+                pairs_chunk = []
+    if pairs_chunk:
+        tasks.append((points, pairs_chunk))
+
+    # Run pool
+    edges = set()
+    with mp.Pool(processes=processes) as pool:
+        for part in pool.imap_unordered(_bf_worker, tasks, chunksize=1):
+            edges |= part
+
+    hull_pts = list(edges)
+    if len(hull_pts) <= 2:
+        return hull_pts
+
+    cx = sum(p[0] for p in hull_pts) / len(hull_pts)
+    cy = sum(p[1] for p in hull_pts) / len(hull_pts)
+    hull_pts.sort(key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
     return hull_pts
 
 
@@ -132,11 +217,14 @@ class ConvexHullApp:
         ctrl.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(ctrl, text="N (nokta sayısı):").pack(side=tk.LEFT)
-        self.n_var = tk.StringVar(value="100")
+        self.n_var = tk.StringVar(value="1000")
         ttk.Entry(ctrl, textvariable=self.n_var, width=10).pack(side=tk.LEFT, padx=8)
 
         ttk.Button(ctrl, text="Rastgele Nokta Üret", command=self.generate_points).pack(side=tk.LEFT, padx=6)
+
+        # Brute Force now uses multi-core
         ttk.Button(ctrl, text="Brute Force Hull (çiz + süre ölç)", command=self.run_bruteforce).pack(side=tk.LEFT, padx=6)
+
         ttk.Button(ctrl, text="Graham Scan Hull (çiz + süre ölç)", command=self.run_graham).pack(side=tk.LEFT, padx=6)
 
         ttk.Separator(ctrl, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=10)
@@ -199,12 +287,9 @@ class ConvexHullApp:
 
         self.canvas.draw_idle()
 
-    # ---------- Performance graph (robust) ----------
     def draw_performance_graph(self):
         self.ax.clear()
-
-        # GRAPH VIEW: MUST disable equal aspect to avoid log+aspect issues
-        self.ax.set_aspect("auto")
+        self.ax.set_aspect("auto")  # IMPORTANT: avoid log+equal conflicts
 
         def aggregate_by_n_avg(data):
             if not data:
@@ -243,7 +328,6 @@ class ConvexHullApp:
             self.canvas.draw_idle()
             return
 
-        # Plot series
         all_y = []
         if bd:
             bx, by = zip(*bd)
@@ -258,12 +342,10 @@ class ConvexHullApp:
         self.ax.set_title("Performans Karşılaştırması")
         self.ax.legend()
 
-        # LOG scale only if safe
         if all_y and all(t > 0 and math.isfinite(t) for t in all_y):
             self.ax.set_yscale("log")
             self.ax.set_ylabel("Süre (saniye) - log")
 
-            # Safe, finite ylim to prevent overflow in tick generation
             ymin = min(all_y)
             ymax = max(all_y)
             if ymin == ymax:
@@ -273,7 +355,6 @@ class ConvexHullApp:
                 ymin = ymin * 0.8
                 ymax = ymax * 1.2
 
-            # clamp to avoid extreme log ranges
             ymin = max(ymin, 1e-12)
             ymax = min(ymax, 1e12)
 
@@ -283,7 +364,6 @@ class ConvexHullApp:
 
         self.canvas.draw_idle()
 
-    # ---------- Actions ----------
     def run_bruteforce(self):
         if not self.points:
             self.generate_points()
@@ -291,15 +371,19 @@ class ConvexHullApp:
                 return
 
         n = len(self.points)
-        self.status.set("Brute Force çalışıyor...")
+        self.status.set("Brute Force (çok çekirdek) çalışıyor...")
         self.root.update_idletasks()
 
         t0 = time.perf_counter()
-        hull = brute_force_hull(self.points)
+
+        # Multi-core brute force
+        # You can tune processes/chunk_pairs if desired:
+        # hull = brute_force_hull_parallel(self.points, processes=4, chunk_pairs=8000)
+        hull = brute_force_hull_parallel(self.points, processes=6, chunk_pairs=12000)
+
         t1 = time.perf_counter()
 
-        elapsed = t1 - t0
-        elapsed = max(elapsed, 1e-9)
+        elapsed = max(t1 - t0, 1e-9)
 
         self.hull = hull
         self.hull_label = f"Brute Force Hull | N={n} | süre={elapsed:.6f} s"
@@ -326,8 +410,7 @@ class ConvexHullApp:
         hull = graham_scan(self.points)
         t1 = time.perf_counter()
 
-        elapsed = t1 - t0
-        elapsed = max(elapsed, 1e-9)
+        elapsed = max(t1 - t0, 1e-9)
 
         self.hull = hull
         self.hull_label = f"Graham Scan Hull | N={n} | süre={elapsed:.6f} s"
@@ -361,6 +444,9 @@ class ConvexHullApp:
 
 
 if __name__ == "__main__":
+    # IMPORTANT for Windows multiprocessing
+    mp.freeze_support()
+
     root = tk.Tk()
     app = ConvexHullApp(root)
     root.mainloop()
